@@ -1,0 +1,137 @@
+name: s3pg tests
+
+# The storage/s3pg suite on PostgreSQL, and the conformance server end to end
+# (tlog-tiles API, restart against an existing log, fsck). Lives in its own
+# file so that upstream's workflow files stay untouched and merge cleanly.
+
+on:
+  push:
+    branches: [s3pg]
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      ref:
+        description: The git ref to test.
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  s3pg-postgres:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: tessera_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready --username=postgres --dbname=tessera_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+
+    env:
+      PGHOST: 127.0.0.1
+      PGPORT: '5432'
+      TESSERA_S3PG_TEST_DSN: postgres://postgres:postgres@127.0.0.1:5432/tessera_test?sslmode=disable
+      # S3-backed tests use static credentials test/test, which MinIO rejects (secrets must
+      # be >= 8 characters), so they run against moto's S3 server instead.
+      TESSERA_S3PG_TEST_S3_ENDPOINT: http://127.0.0.1:9000
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          persist-credentials: false
+      - name: Install Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: Raise max_connections
+        # The default of 100 is too low for the parallel suite (each test opens several pools).
+        run: |
+          PGPASSWORD=postgres psql -X -v ON_ERROR_STOP=1 -U postgres -d postgres -c "ALTER SYSTEM SET max_connections = 300"
+          docker restart "${{ job.services.postgres.id }}"
+          for i in $(seq 1 60); do pg_isready -q -U postgres && break; sleep 1; done
+      - name: Start S3-compatible server (moto)
+        run: |
+          python3 -m venv "$RUNNER_TEMP/moto"
+          "$RUNNER_TEMP/moto/bin/pip" install --quiet 'moto[server]==5.2.3'
+          nohup "$RUNNER_TEMP/moto/bin/moto_server" -H 127.0.0.1 -p 9000 > "$RUNNER_TEMP/moto.log" 2>&1 &
+          for i in $(seq 1 30); do curl -s -o /dev/null http://127.0.0.1:9000/ && exit 0; sleep 1; done
+          cat "$RUNNER_TEMP/moto.log"; exit 1
+      - name: Test with Go
+        # Tests isolate themselves in per-test PostgreSQL schemas and S3 buckets, so they can run in parallel.
+        run: go test -v -race ./storage/s3pg/... -pg_test_optional=false
+
+  s3pg-tlog-tiles-api:
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        antispam: [false, true]
+
+    env:
+      COMPOSE_FILE: ./deployment/live/s3pg/compose.yaml
+      TESSERA_ANTISPAM: ${{ matrix.antispam }}
+      LOG_READ_URL: http://localhost:9000/tessera-log/
+      LOG_WRITE_URL: http://localhost:2024
+      LOG_PUBLIC_KEY: example.com/log/testdata+33d7b496+AeHTu4Q3hEIMHNqc6fASMsq3rKNx280NI+oO5xCFkkSx
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          persist-credentials: false
+      - name: Install Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: Start Docker services (postgres, minio, tessera-conformance-s3pg)
+        run: docker compose up --build --detach
+      - name: Wait for the log to be ready
+        run: |
+          for i in $(seq 1 60); do
+            curl -sf "http://localhost:2024/healthz" > /dev/null && curl -sf "${LOG_READ_URL}checkpoint" && exit 0
+            sleep 2
+          done
+          echo "Log did not become ready"; exit 1
+      - name: Run log integration test
+        run: go test -v -race ./integration/log --run_integration_test=true --log_url="${LOG_READ_URL}" --write_log_url="${LOG_WRITE_URL}" --log_public_key="${LOG_PUBLIC_KEY}"
+      - name: Restart the conformance server
+        # Exercises graceful shutdown, and start-up against an existing log (--skip_schema_init, existing checkpoint).
+        run: |
+          docker compose restart tessera-conformance-s3pg
+          for i in $(seq 1 60); do
+            curl -sf "http://localhost:2024/healthz" > /dev/null && exit 0
+            sleep 2
+          done
+          echo "Log did not become ready after restart"; exit 1
+      - name: Re-run log integration test against the existing log
+        run: go test -v -race -count=1 ./integration/log --run_integration_test=true --log_url="${LOG_READ_URL}" --write_log_url="${LOG_WRITE_URL}" --log_public_key="${LOG_PUBLIC_KEY}"
+      - name: Verify the whole log with fsck
+        run: |
+          printf "%s" "${LOG_PUBLIC_KEY}" > "${RUNNER_TEMP}/log.pub"
+          go run ./cmd/fsck --storage_url="${LOG_READ_URL}" --public_key="${RUNNER_TEMP}/log.pub" --ui=false
+      - name: Show coordination state
+        if: ${{ always() }}
+        run: |
+          docker compose exec -T postgres psql -U postgres -d tessera -c "SELECT (SELECT next FROM tessera_log.SeqCoord) AS next_index, (SELECT seq FROM tessera_log.IntCoord) AS integrated_size, (SELECT count(*) FROM tessera_log.Seq) AS pending_batches, (SELECT size FROM tessera_log.PubCoord) AS published_size, (SELECT fromSize FROM tessera_log.GCCoord) AS gc_from_size;" || true
+          docker compose ps --all
+      - name: Docker logs
+        if: ${{ always() }}
+        run: docker compose logs --no-color
+      - name: Stop Docker services
+        if: ${{ always() }}
+        run: docker compose down --volumes

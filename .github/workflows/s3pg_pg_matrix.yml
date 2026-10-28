@@ -1,0 +1,123 @@
+name: s3pg PostgreSQL matrix
+
+# Runs the storage/s3pg test suite, and a least-privilege end-to-end check of the deployment
+# scripts (roles, migrations, conformance server with --skip_schema_init), against every
+# supported PostgreSQL major version (storage/s3pg/README.md: PostgreSQL 13 or newer).
+
+on:
+  push:
+    paths:
+      - 'storage/s3pg/**'
+      - 'cmd/conformance/s3pg/**'
+      - 'deployment/live/s3pg/**'
+      - '.github/workflows/s3pg_pg_matrix.yml'
+  pull_request:
+    paths:
+      - 'storage/s3pg/**'
+      - 'cmd/conformance/s3pg/**'
+      - 'deployment/live/s3pg/**'
+      - '.github/workflows/s3pg_pg_matrix.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  s3pg-postgres:
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        postgres: ['13', '14', '15', '16', '17', '18']
+
+    services:
+      postgres:
+        image: postgres:${{ matrix.postgres }}
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: tessera_test
+        ports:
+          - 5432:5432
+        # The suite runs many parallel tests, each with several pools.
+        options: >-
+          --health-cmd "pg_isready --username=postgres --dbname=tessera_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+
+    env:
+      PGHOST: 127.0.0.1
+      PGPORT: '5432'
+      TESSERA_S3PG_TEST_DSN: postgres://postgres:postgres@127.0.0.1:5432/tessera_test?sslmode=disable
+      # S3-backed tests use static credentials test/test, which MinIO rejects (secrets must
+      # be >= 8 characters), so they run against moto's S3 server instead.
+      TESSERA_S3PG_TEST_S3_ENDPOINT: http://127.0.0.1:9000
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: Raise max_connections
+        # The default of 100 is too low for the parallel suite (each test opens several pools).
+        run: |
+          PGPASSWORD=postgres psql -X -v ON_ERROR_STOP=1 -U postgres -d postgres -c "ALTER SYSTEM SET max_connections = 300"
+          docker restart "${{ job.services.postgres.id }}"
+          for i in $(seq 1 60); do pg_isready -q -U postgres && break; sleep 1; done
+          PGPASSWORD=postgres psql -X -At -U postgres -d postgres -c "SELECT version()" -c "SHOW max_connections"
+
+      - name: Start S3-compatible server (moto)
+        run: |
+          python3 -m venv "$RUNNER_TEMP/moto"
+          "$RUNNER_TEMP/moto/bin/pip" install --quiet 'moto[server]==5.2.3' boto3
+          nohup "$RUNNER_TEMP/moto/bin/moto_server" -H 127.0.0.1 -p 9000 > "$RUNNER_TEMP/moto.log" 2>&1 &
+          for i in $(seq 1 30); do curl -s -o /dev/null http://127.0.0.1:9000/ && exit 0; sleep 1; done
+          cat "$RUNNER_TEMP/moto.log"; exit 1
+
+      - name: Test with Go
+        run: go test -v -race ./storage/s3pg/... -pg_test_optional=false
+
+      - name: Least-privilege end-to-end (roles, migrations, --skip_schema_init)
+        env:
+          PGPASSWORD: postgres
+          LOG_PUBLIC_KEY: example.com/log/testdata+33d7b496+AeHTu4Q3hEIMHNqc6fASMsq3rKNx280NI+oO5xCFkkSx
+          TESSERA_SIGNER: PRIVATE+KEY+example.com/log/testdata+33d7b496+AeymY/SZAX0jZcJ8enZ5FY1Dz+wTML2yWSkK+9DSF3eg
+        run: |
+          set -eu
+          psql -X -q -v ON_ERROR_STOP=1 -U postgres -d postgres -c "CREATE DATABASE tessera"
+          POSTGRES_USER=postgres POSTGRES_DB=tessera TESSERA_OWNER_PASSWORD=ownerpw TESSERA_APP_PASSWORD=apppw \
+            sh deployment/live/s3pg/postgres-init/10-tessera-roles.sh
+          # Twice: the migrations must be idempotent.
+          for i in 1 2; do
+            PGDATABASE=tessera PGUSER=tessera_owner PGPASSWORD=ownerpw sh deployment/live/s3pg/migrate.sh \
+              tessera_log storage/s3pg/schema.sql tessera_antispam storage/s3pg/antispam/schema.sql
+          done
+          "$RUNNER_TEMP/moto/bin/python" - <<'EOF'
+          import boto3, json
+          s3 = boto3.client("s3", endpoint_url="http://127.0.0.1:9000", aws_access_key_id="test", aws_secret_access_key="test", region_name="us-east-1")
+          s3.create_bucket(Bucket="tessera-log")
+          s3.put_bucket_policy(Bucket="tessera-log", Policy=json.dumps({"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Principal": "*", "Action": ["s3:GetObject"], "Resource": ["arn:aws:s3:::tessera-log/*"]}]}))
+          EOF
+          go build -o "$RUNNER_TEMP/conformance-s3pg" ./cmd/conformance/s3pg
+          TESSERA_PG_DSN="postgres://tessera_app@127.0.0.1:5432/tessera?sslmode=disable" \
+          TESSERA_ANTISPAM_PG_DSN="postgres://tessera_app@127.0.0.1:5432/tessera?sslmode=disable" \
+          PGPASSWORD=apppw TESSERA_S3_ACCESS_KEY=test TESSERA_S3_SECRET=test \
+            "$RUNNER_TEMP/conformance-s3pg" --bucket=tessera-log --s3_endpoint=http://127.0.0.1:9000 --skip_schema_init --pg_schema=tessera_log --antispam_pg_schema=tessera_antispam \
+              --antispam=true --listen=127.0.0.1:2024 --pg_max_conns=8 > "$RUNNER_TEMP/server.log" 2>&1 &
+          for i in $(seq 1 60); do curl -sf http://127.0.0.1:2024/healthz > /dev/null && break; sleep 1; done
+          go test -v -race -count=1 ./integration/log --run_integration_test=true \
+            --log_url=http://127.0.0.1:9000/tessera-log/ --write_log_url=http://127.0.0.1:2024 --log_public_key="${LOG_PUBLIC_KEY}"
+          printf "%s" "${LOG_PUBLIC_KEY}" > "${RUNNER_TEMP}/log.pub"
+          go run ./cmd/fsck --storage_url=http://127.0.0.1:9000/tessera-log/ --public_key="${RUNNER_TEMP}/log.pub" --ui=false
+
+      - name: Server log
+        if: ${{ always() }}
+        run: cat "$RUNNER_TEMP/server.log" || true
