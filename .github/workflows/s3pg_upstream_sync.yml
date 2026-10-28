@@ -88,6 +88,9 @@ jobs:
   test:
     needs: merge
     if: needs.merge.outputs.changed == 'true'
+    permissions:
+      contents: read
+      packages: read
     uses: ./.github/workflows/s3pg_test.yml
     with:
       ref: upstream-sync

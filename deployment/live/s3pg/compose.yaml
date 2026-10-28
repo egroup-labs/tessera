@@ -20,7 +20,9 @@ x-postgres-image: &postgres-image postgres:16.10-alpine
 # you deploy. The s3pg driver requires S3 conditional writes: PutObject with `If-None-Match: *`
 # (MinIO RELEASE.2024-05-07T06-41-25Z onwards) and with `If-Match: <etag>` (used for checkpoints;
 # check your release with integration/minio/s3pg, probes "ifmatch" and "ifmatch-race").
-x-minio-image: &minio-image quay.io/minio/minio:RELEASE.2025-09-06T17-38-46Z
+# MinIO no longer publishes images, so the default is aibox's mirror of the release aibox runs
+# (private: `docker login ghcr.io` first); set TESSERA_MINIO_IMAGE to use your own.
+x-minio-image: &minio-image ${TESSERA_MINIO_IMAGE:-ghcr.io/egroup-labs/aibox/minio:RELEASE.2025-01-20T14-49-07Z}
 
 services:
 
