@@ -201,7 +201,7 @@ func main() {
 		os.Exit(2)
 	}
 	db.SetMaxOpenConns(2)
-	var ev io.Writer = io.Discard
+	ev := io.Discard
 	if *eventLog != "" {
 		f, err := os.OpenFile(*eventLog, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
 		if err == nil {
