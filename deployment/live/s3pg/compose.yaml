@@ -1,0 +1,156 @@
+# Tessera s3pg conformance stack: PostgreSQL + MinIO + the conformance personality.
+#
+# This is a TEST/DEV deployment: the credentials below are well-known defaults and the
+# checkpoint signing key is a published example key. See README.md in this directory.
+#
+#   docker compose -f deployment/live/s3pg/compose.yaml up --build --detach
+#
+# Log writes:  http://localhost:2024/add
+# Log reads:   http://localhost:9000/tessera-log/  (public-read MinIO bucket)
+# Public key:  example.com/log/testdata+33d7b496+AeHTu4Q3hEIMHNqc6fASMsq3rKNx280NI+oO5xCFkkSx
+#
+# All credentials can be overridden with environment variables (or an .env file next to
+# this file); the defaults are only suitable for local testing.
+
+name: tessera-s3pg
+
+# Requires PostgreSQL 13 or newer; as with MinIO, test with the major version you run.
+x-postgres-image: &postgres-image postgres:16.10-alpine
+# Operators: pin the SAME MinIO release you run in production, so that this stack tests what
+# you deploy. The s3pg driver requires S3 conditional writes: PutObject with `If-None-Match: *`
+# (MinIO RELEASE.2024-05-07T06-41-25Z onwards) and with `If-Match: <etag>` (used for checkpoints;
+# check your release with integration/minio/s3pg, probes "ifmatch" and "ifmatch-race").
+x-minio-image: &minio-image quay.io/minio/minio:RELEASE.2025-09-06T17-38-46Z
+
+services:
+
+  postgres:
+    image: *postgres-image
+    environment:
+      POSTGRES_DB: tessera
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres-dev-only}
+      # Used by postgres-init/10-tessera-roles.sh when the data directory is first created.
+      TESSERA_OWNER_PASSWORD: ${TESSERA_OWNER_PASSWORD:-tessera-owner-dev-only}
+      TESSERA_APP_PASSWORD: ${TESSERA_APP_PASSWORD:-tessera-app-dev-only}
+    volumes:
+      - ./postgres-init:/docker-entrypoint-initdb.d:ro
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      # Check over TCP: while the init scripts run, the entrypoint's temporary server only
+      # listens on the Unix socket, and must not be reported as healthy.
+      test: ["CMD", "pg_isready", "--host=127.0.0.1", "--username=postgres", "--dbname=tessera"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+    restart: unless-stopped
+
+  # Applies storage/s3pg/schema.sql (and the antispam schema) as the owning role, like a
+  # migration tool would, so that the server can run with --skip_schema_init as a role
+  # without DDL privileges. Idempotent; runs on every `up`.
+  migrate:
+    image: *postgres-image
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGHOST: postgres
+      PGDATABASE: tessera
+      PGUSER: tessera_owner
+      PGPASSWORD: ${TESSERA_OWNER_PASSWORD:-tessera-owner-dev-only}
+    volumes:
+      - ./migrate.sh:/migrate.sh:ro
+      - ../../../storage/s3pg/schema.sql:/schema/log.sql:ro
+      - ../../../storage/s3pg/antispam/schema.sql:/schema/antispam.sql:ro
+    entrypoint: ["/bin/sh", "/migrate.sh"]
+    command: ["tessera_log", "/schema/log.sql", "tessera_antispam", "/schema/antispam.sql"]
+    restart: "no"
+
+  minio:
+    image: *minio-image
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin-dev-only}
+    ports:
+      # Bound to localhost only: anonymous reads of the log bucket are allowed.
+      - "127.0.0.1:9000:9000"
+    volumes:
+      - miniodata:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+    restart: unless-stopped
+
+  # One-shot: creates the bucket, makes it publicly readable, and creates the server's
+  # least-privilege access key. Idempotent; runs on every `up`.
+  minio-init:
+    image: *minio-image
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      MINIO_ENDPOINT: http://minio:9000
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin-dev-only}
+      TESSERA_BUCKET: tessera-log
+      TESSERA_S3_ACCESS_KEY: ${TESSERA_S3_ACCESS_KEY:-tessera-log-writer}
+      TESSERA_S3_SECRET: ${TESSERA_S3_SECRET:-tessera-log-writer-dev-only}
+    volumes:
+      - ./minio-init.sh:/minio-init.sh:ro
+    entrypoint: ["/bin/sh", "/minio-init.sh"]
+    restart: "no"
+
+  tessera-conformance-s3pg:
+    build:
+      context: ../../../
+      dockerfile: ./cmd/conformance/s3pg/Dockerfile
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      minio-init:
+        condition: service_completed_successfully
+    ports:
+      - "127.0.0.1:2024:2024"
+    environment:
+      # Secrets are passed via the environment rather than flags so they don't show up in
+      # process listings. The DB password comes from the standard PGPASSWORD variable.
+      # Schemas are selected with --pg_schema / --antispam_pg_schema (every statement names its
+      # tables fully), not with search_path, so this also works through PgBouncer.
+      TESSERA_PG_DSN: postgres://tessera_app@postgres:5432/tessera?sslmode=disable&application_name=tessera-conformance
+      TESSERA_ANTISPAM_PG_DSN: postgres://tessera_app@postgres:5432/tessera?sslmode=disable&application_name=tessera-conformance-antispam
+      PGPASSWORD: ${TESSERA_APP_PASSWORD:-tessera-app-dev-only}
+      TESSERA_S3_ACCESS_KEY: ${TESSERA_S3_ACCESS_KEY:-tessera-log-writer}
+      TESSERA_S3_SECRET: ${TESSERA_S3_SECRET:-tessera-log-writer-dev-only}
+      # Example key from cmd/conformance/posix/docker/compose.yaml. NEVER use it for a real log.
+      TESSERA_SIGNER: ${TESSERA_SIGNER:-PRIVATE+KEY+example.com/log/testdata+33d7b496+AeymY/SZAX0jZcJ8enZ5FY1Dz+wTML2yWSkK+9DSF3eg}
+    command:
+      - --listen=:2024
+      - --bucket=tessera-log
+      - --s3_endpoint=http://minio:9000
+      - --skip_schema_init
+      - --pg_schema=tessera_log
+      - --antispam_pg_schema=tessera_antispam
+      - --pg_max_conns=16
+      - --pg_max_idle_conns=4
+      - --antispam=${TESSERA_ANTISPAM:-false}
+      - --slog_level=${TESSERA_SLOG_LEVEL:-0}
+    healthcheck:
+      # /healthz succeeds once the server is up and can read its checkpoint from MinIO, and fails
+      # permanently if the coordination database is found to be behind the published log.
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:2024/healthz"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+    # Graceful shutdown waits up to 10s for in-flight requests, then up to 60s for entries already
+    # sequenced by this instance to be integrated and published.
+    stop_grace_period: 75s
+    restart: unless-stopped
+
+volumes:
+  # Log state lives in BOTH volumes: always keep or delete them together
+  # (`docker compose down --volumes`), never just one of them.
+  pgdata:
+  miniodata:
