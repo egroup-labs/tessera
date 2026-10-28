@@ -76,11 +76,16 @@ go mod tidy
 Pin a commit whose `s3pg tests` run is green, not the branch name.
 
 Dependency CVEs (pgx, the AWS SDK, …) need no fork change: bump them in tlog's
-`go.mod`, which wins over this fork's minimums. A CVE in Tessera itself is
-published against `github.com/transparency-dev/tessera`; scanners in aibox see
-the fork's module path and version, so a Tessera advisory is matched only by
-the upstream version the fork has merged. Take upstream fixes through the sync
-PR, then re-pin aibox.
+`go.mod`, which wins over this fork's minimums.
+
+A CVE in Tessera itself is published against `github.com/transparency-dev/tessera`,
+but trivy and govulncheck look a replaced module up by its replacement path,
+which no advisory names: aibox's scans never report one. `s3pg advisories`
+covers it instead. It runs daily, queries OSV for Tessera, and fails when a
+fix's release tag is not merged into `s3pg`. On a failure, run the sync
+(Actions → s3pg upstream sync → Run workflow), merge its PR, then re-pin aibox.
+A fix tagged only on an upstream release branch also fails the check; if main
+carries the same fix, say so in the sync PR.
 
 ## Upstreaming
 

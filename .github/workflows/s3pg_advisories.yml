@@ -1,0 +1,53 @@
+name: s3pg advisories
+
+# Fails when a published advisory for github.com/transparency-dev/tessera is
+# not fixed on s3pg. Scanners downstream (trivy, govulncheck) look modules up
+# by the replacement path, github.com/egroup-labs/tessera, which no advisory
+# names, so this is the only place a Tessera advisory is matched. See FORK.md.
+
+on:
+  schedule:
+    - cron: '17 5 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout s3pg
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: s3pg
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Check OSV for unfixed advisories
+        run: |
+          set -eu
+          git fetch --quiet --tags https://github.com/transparency-dev/tessera.git
+          curl -sf -d '{"package":{"name":"github.com/transparency-dev/tessera","ecosystem":"Go"}}' \
+            https://api.osv.dev/v1/query > "$RUNNER_TEMP/osv.json"
+          # One line per advisory: id, then its fixed versions (none: unfixed).
+          jq -r '.vulns // [] | .[] | [.id, ([.affected[].ranges[]?.events[]? | .fixed // empty] | join(" "))] | @tsv' \
+            "$RUNNER_TEMP/osv.json" > "$RUNNER_TEMP/advisories.tsv"
+          echo "advisories for transparency-dev/tessera: $(wc -l < "$RUNNER_TEMP/advisories.tsv")"
+          bad=0
+          while IFS="$(printf '\t')" read -r id fixed; do
+            ok=no
+            for v in $fixed; do
+              if git rev-parse -q --verify "refs/tags/v$v" >/dev/null && git merge-base --is-ancestor "v$v" HEAD; then
+                ok=yes
+              fi
+            done
+            if [ "$ok" = yes ]; then
+              echo "$id: fixed on s3pg"
+            else
+              # A fix tagged only on a release branch also lands here: check
+              # whether main carries it, and note that in the sync PR.
+              echo "::error::$id is not fixed on s3pg (fixed in: ${fixed:-no release}): https://osv.dev/vulnerability/$id"
+              bad=1
+            fi
+          done < "$RUNNER_TEMP/advisories.tsv"
+          exit "$bad"
