@@ -1,17 +1,22 @@
 name: s3pg upstream sync
 
-# Weekly: merge upstream main into s3pg on the upstream-sync branch, run the
-# s3pg tests on the result, and open (or refresh) a PR with what upstream
-# changed in the code storage/s3pg was derived from. A reviewer ports those
-# changes by hand (storage/s3pg/README.md, "Porting upstream changes"), then
-# merges the PR with a merge commit. See FORK.md.
+# Weekly: merge upstream main into the upstream-sync branch, build and test
+# the merge, and open (or refresh) a PR listing what upstream changed in the
+# code storage/s3pg is derived from. A reviewer ports those changes onto
+# upstream-sync by hand and merges the PR with a merge commit. See FORK.md.
+#
+# An open sync is continued, never rebuilt: the branch only ever gets merges
+# and fast-forward pushes, so commits a reviewer pushed to it survive every
+# later run.
 
 on:
   schedule:
     - cron: '0 6 * * 1'
   workflow_dispatch:
 
-concurrency: s3pg-upstream-sync
+concurrency:
+  group: s3pg-upstream-sync
+  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -22,21 +27,32 @@ env:
 jobs:
   merge:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
+    # SYNC_TOKEN lives in this environment, whose deployments are limited to
+    # the s3pg branch: workflows on other refs (upstream's own, which the
+    # merge brings in and the sync PR runs) cannot read it.
+    environment: upstream-sync
     outputs:
       changed: ${{ steps.merge.outputs.changed }}
       from: ${{ steps.merge.outputs.from }}
       to: ${{ steps.merge.outputs.to }}
+      sha: ${{ steps.merge.outputs.sha }}
+      build: ${{ steps.build.outputs.build }}
+      build_log: ${{ steps.build.outputs.log }}
     steps:
+      - name: Require SYNC_TOKEN
+        env:
+          SYNC_TOKEN: ${{ secrets.SYNC_TOKEN }}
+        run: |
+          if [ -z "$SYNC_TOKEN" ]; then
+            echo "::error::SYNC_TOKEN is not set in the upstream-sync environment (FORK.md). The workflow token cannot push upstream commits that change .github/workflows."
+            exit 1
+          fi
       - name: Checkout s3pg
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: s3pg
           fetch-depth: 0
-          # GITHUB_TOKEN may not push commits that change .github/workflows,
-          # and upstream's often do; SYNC_TOKEN (FORK.md) can.
-          token: ${{ secrets.SYNC_TOKEN || github.token }}
+          token: ${{ secrets.SYNC_TOKEN }}
       - name: Install Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
@@ -49,19 +65,37 @@ jobs:
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git fetch --quiet "$UPSTREAM" main
           to=$(git rev-parse FETCH_HEAD)
-          from=$(git merge-base HEAD "$to")
+          from=$(git merge-base origin/s3pg "$to")
           echo "from=$from" >> "$GITHUB_OUTPUT"
           echo "to=$to" >> "$GITHUB_OUTPUT"
-          if [ "$from" = "$to" ]; then
-            echo "s3pg already contains upstream main ($to)"
+          pgx=$(go list -m -f '{{.Version}}' github.com/jackc/pgx/v5)
+
+          # Continue an open sync (the branch is deleted when its PR merges).
+          if git ls-remote --exit-code --heads origin upstream-sync >/dev/null; then
+            git fetch --quiet origin upstream-sync
+            git checkout -B upstream-sync origin/upstream-sync
+            git merge --no-edit origin/s3pg
+          else
+            git checkout -B upstream-sync origin/s3pg
+          fi
+          if git merge-base --is-ancestor "$to" HEAD; then
+            echo "nothing new upstream: $to is already merged"
             echo "changed=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          pgx=$(go list -m -f '{{.Version}}' github.com/jackc/pgx/v5)
-          git checkout -B upstream-sync
+
+          # The fork's go.mod may differ from upstream's only by pgx and its
+          # dependencies (FORK.md rule 1): anything else would be dropped
+          # silently by the conflict resolution below.
+          base=$(git merge-base HEAD "$to")
+          extra=$(git diff "$base" HEAD -- go.mod | grep -E '^[+-][^+-]' | grep -v -E 'jackc/(pgx|pgpassfile|pgservicefile|puddle)' || true)
+          if [ -n "$extra" ]; then
+            echo "::error file=go.mod::the fork's go.mod differs from upstream beyond pgx; merge upstream by hand (FORK.md):"
+            echo "$extra"
+            exit 1
+          fi
+
           if ! git merge --no-ff --no-edit -m "Merge upstream main ($(git rev-parse --short "$to"))" "$to"; then
-            # s3pg only adds files, so go.mod/go.sum (the pgx requirement) are
-            # the only expected conflicts: take upstream's and re-add pgx.
             for f in $(git diff --name-only --diff-filter=U); do
               case "$f" in
                 go.mod|go.sum) ;;
@@ -78,43 +112,53 @@ jobs:
           if ! git diff --quiet; then
             git commit -am "go mod tidy"
           fi
-          go build ./...
-          if ! git push --force origin upstream-sync "$to:refs/heads/main"; then
-            echo "::error::push refused: upstream changed .github/workflows, which needs the SYNC_TOKEN secret (FORK.md)"
-            exit 1
-          fi
+          # Never forced: a rejected push means the branch moved under us.
+          git push origin upstream-sync
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
           echo "changed=true" >> "$GITHUB_OUTPUT"
+      - name: Build
+        id: build
+        if: steps.merge.outputs.changed == 'true'
+        run: |
+          # A failing build is the likeliest sign of an upstream change to
+          # port, so it is reported on the PR rather than ending the run.
+          if go build ./... 2> "$RUNNER_TEMP/build.log"; then
+            echo "build=ok" >> "$GITHUB_OUTPUT"
+          else
+            echo "build=failed" >> "$GITHUB_OUTPUT"
+            { echo 'log<<EOF_BUILD_LOG'; tail -n 40 "$RUNNER_TEMP/build.log"; echo 'EOF_BUILD_LOG'; } >> "$GITHUB_OUTPUT"
+          fi
 
   test:
     needs: merge
-    if: needs.merge.outputs.changed == 'true'
+    if: needs.merge.outputs.changed == 'true' && needs.merge.outputs.build == 'ok'
     permissions:
       contents: read
       packages: read
     uses: ./.github/workflows/s3pg_test.yml
     with:
-      ref: upstream-sync
+      ref: ${{ needs.merge.outputs.sha }}
 
   pr:
     needs: [merge, test]
     if: ${{ always() && needs.merge.outputs.changed == 'true' }}
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      pull-requests: write
+    environment: upstream-sync
     steps:
       - name: Checkout upstream-sync
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: upstream-sync
+          ref: ${{ needs.merge.outputs.sha }}
           fetch-depth: 0
           persist-credentials: false
       - name: Open or update the sync PR
         env:
-          # A PR opened with GITHUB_TOKEN runs no checks; with SYNC_TOKEN it does.
-          GH_TOKEN: ${{ secrets.SYNC_TOKEN || github.token }}
+          # A PR opened with the workflow token runs no checks; with SYNC_TOKEN it does.
+          GH_TOKEN: ${{ secrets.SYNC_TOKEN }}
           FROM: ${{ needs.merge.outputs.from }}
           TO: ${{ needs.merge.outputs.to }}
+          BUILD: ${{ needs.merge.outputs.build }}
+          BUILD_LOG: ${{ needs.merge.outputs.build_log }}
           TESTS: ${{ needs.test.result }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
@@ -122,14 +166,23 @@ jobs:
           # Upstream code that storage/s3pg is derived from or builds on.
           watched='storage/aws storage/internal internal api append.go options.go go.mod'
           {
-            echo "Merges upstream main \`${FROM:0:12}\` → \`${TO:0:12}\` ([compare](https://github.com/transparency-dev/tessera/compare/${FROM}...${TO}))."
+            echo "Merges upstream main up to \`${TO:0:12}\` ([changes since s3pg last merged upstream](https://github.com/transparency-dev/tessera/compare/${FROM}...${TO}))."
             echo
-            echo "**s3pg tests on the merge: ${TESTS}** ([run](${RUN_URL}))"
+            if [ "$BUILD" = ok ]; then
+              echo "**Build: ok. s3pg tests on the merge: ${TESTS}** ([run](${RUN_URL}))"
+            else
+              echo "**Build FAILS on the merge, so the tests did not run** ([run](${RUN_URL})). Port the upstream change below until it builds:"
+              echo
+              echo '```'
+              printf '%s\n' "$BUILD_LOG"
+              echo '```'
+            fi
             echo
             echo "### Upstream changes to port by hand"
             echo
             echo "\`storage/s3pg\` is derived from these paths; nothing of theirs reaches it automatically."
-            echo "Port what applies (\`storage/s3pg/README.md\`, \"Porting upstream changes\"), or say why not."
+            echo "Push the ports to this branch (\`upstream-sync\`): later sync runs merge into it and keep them."
+            echo "See \`storage/s3pg/README.md\`, \"Porting upstream changes\"."
             echo
             echo '```'
             git log --no-merges --format='%h %s' "$FROM..$TO" -- $watched || true
@@ -140,10 +193,10 @@ jobs:
             echo "- [ ] \`storage/aws\` changes ported to \`storage/s3pg\` (or not applicable)"
             echo "- [ ] \`SchemaCompatibilityVersion\` unchanged, or bumped here with a migration"
             echo
-            echo "Merge with a **merge commit** (never squash or rebase: aibox pins commits on s3pg)."
+            echo "Merge with a **merge commit** (the only method this repository allows): aibox pins commits on s3pg."
           } > "$RUNNER_TEMP/body.md"
-          if gh pr view upstream-sync --json state -q .state 2>/dev/null | grep -q OPEN; then
-            gh pr edit upstream-sync --body-file "$RUNNER_TEMP/body.md"
+          if [ "$(gh pr list --head upstream-sync --state open --json number --jq length)" != 0 ]; then
+            gh pr edit upstream-sync --title "Merge upstream main (${TO:0:12})" --body-file "$RUNNER_TEMP/body.md"
           else
             gh pr create --base s3pg --head upstream-sync \
               --title "Merge upstream main (${TO:0:12})" --body-file "$RUNNER_TEMP/body.md"

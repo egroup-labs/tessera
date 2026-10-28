@@ -11,8 +11,11 @@ differences from `storage/aws`, and its verification are in
 
 - `s3pg` (default): upstream main plus the s3pg commits. aibox pins commits on
   it.
-- `main`: an untouched mirror of upstream main.
-- `upstream-sync`: written by the sync workflow; never commit to it.
+- `upstream-sync`: the open sync, from the sync workflow. Push hand ports to
+  it; later runs merge into it and keep them. It is deleted when its PR merges.
+
+`main` is not maintained; compare with upstream directly
+(`git fetch https://github.com/transparency-dev/tessera.git main`).
 
 ## Rules
 
@@ -30,12 +33,29 @@ It merges upstream main into `upstream-sync`, runs the s3pg tests on the result,
 and opens a PR listing upstream's changes to `storage/aws`, `storage/internal`,
 `internal/` and the appender API.
 
-It needs the repository secret `SYNC_TOKEN`, a fine-grained token for this
-repository only with Contents, Workflows and Pull requests: read and write.
-The workflow token cannot push upstream commits that change
-`.github/workflows`; without the secret, a sync that brings such a commit
-fails with that message, and the others still go through. The job also
-fast-forwards `main` to upstream main.
+If the merged code does not build, the PR still opens, with the build log in
+its description, and the tests are skipped until the port makes it build.
+A merge conflict outside `go.mod`/`go.sum`, or a fork `go.mod` that differs
+from upstream's beyond pgx, stops the run with an error: merge by hand.
+
+### One-time setup
+
+1. **Environment `upstream-sync`** (Settings → Environments): deployment
+   branches limited to `s3pg`. Upstream's own workflows and PR branches then
+   cannot read its secret.
+2. **Secret `SYNC_TOKEN`** in that environment (not a repository secret): a
+   fine-grained token for this repository only, with Contents, Workflows and
+   Pull requests: read and write. It is required; the run fails without it.
+   The workflow token cannot push upstream commits that change
+   `.github/workflows`, and PRs it opens run no checks.
+3. **Package access**: the e2e job pulls aibox's private MinIO mirror. In the
+   `ghcr.io/egroup-labs/aibox/minio` package settings, grant this repository
+   Read under "Manage Actions access".
+4. **Disable upstream workflows** that need upstream's cloud accounts or
+   services (AWS Conformance, Benchmark Go, Scorecard): Actions → workflow →
+   Disable. They stay in the tree, so merges stay clean.
+5. **Branch ruleset on `s3pg`**: require a PR, require the `s3pg tests`
+   checks, block force pushes and deletion.
 
 `storage/s3pg/s3pg.go` is a derived copy of `storage/aws/aws.go`, so a fix
 upstream makes there does not reach s3pg by merging: port it by hand onto
@@ -49,15 +69,20 @@ with this fork. To take the head of `s3pg`:
 
 ```sh
 cd services/tlog
-go mod edit -replace github.com/transparency-dev/tessera=github.com/egroup-labs/tessera@s3pg
+go mod edit -replace github.com/transparency-dev/tessera=github.com/egroup-labs/tessera@<sha>
 go mod tidy
 ```
 
+Pin a commit whose `s3pg tests` run is green, not the branch name.
+
 Dependency CVEs (pgx, the AWS SDK, …) need no fork change: bump them in tlog's
-`go.mod`, which wins over this fork's minimums. Upstream's `govulncheck`
-workflow also runs here, on the fork's own code.
+`go.mod`, which wins over this fork's minimums. A CVE in Tessera itself is
+published against `github.com/transparency-dev/tessera`; scanners in aibox see
+the fork's module path and version, so a Tessera advisory is matched only by
+the upstream version the fork has merged. Take upstream fixes through the sync
+PR, then re-pin aibox.
 
 ## Upstreaming
 
-`git diff main s3pg` is the whole change. Every part of it that upstream
+`git diff <upstream main> s3pg` is the whole change. Every part of it that upstream
 accepts is code this fork no longer carries.
