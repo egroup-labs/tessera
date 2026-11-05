@@ -26,6 +26,20 @@ differences from `storage/aws`, and its verification are in
    `s3pg` by pseudo-version, and a rewritten commit breaks that pin.
    Merge the sync PR with a merge commit (the only merge method this repo allows).
 
+## Change notices (Apache License 2.0, section 4(b))
+
+Upstream files that this fork changes, and where each says so:
+
+- `go.mod`: the `github.com/jackc/pgx/v5` requirement carries the notice on
+  its own line. `go.sum` takes no comments; it differs from upstream by the
+  checksums of pgx and its indirect requirements (`pgpassfile`,
+  `pgservicefile`, `puddle`), and this paragraph is its notice.
+- `storage/s3pg/s3pg.go`: a derived copy of `storage/aws/aws.go`; the notice
+  is in its file header.
+
+Every other file of the fork is either an unchanged upstream file or a file the
+fork adds.
+
 ## Taking upstream changes
 
 `s3pg upstream sync` runs every Monday (or on demand: Actions → Run workflow).

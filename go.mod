@@ -23,7 +23,7 @@ require (
 	github.com/gdamore/tcell/v2 v2.13.10
 	github.com/google/go-cmp v0.7.0
 	github.com/hashicorp/golang-lru/v2 v2.0.7
-	github.com/jackc/pgx/v5 v5.11.0
+	github.com/jackc/pgx/v5 v5.11.0 // added by E-Group ICT Software Zrt. for storage/s3pg (Apache-2.0 section 4(b))
 	github.com/muesli/termenv v0.16.0
 	github.com/rivo/tview v0.42.0
 	github.com/transparency-dev/formats v0.1.2-0.20261013130728-340a9e55b2b7
