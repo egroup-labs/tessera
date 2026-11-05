@@ -11,6 +11,10 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+//
+// Modified by E-Group ICT Software Zrt. (2026). This file is a derived copy of
+// storage/aws/aws.go, changed to use PostgreSQL instead of MySQL for sequencing;
+// storage/s3pg/README.md lists the differences (Apache License 2.0, section 4(b)).
 
 // Package s3pg contains an S3 + PostgreSQL storage implementation for Tessera.
 //
